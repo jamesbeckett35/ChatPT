@@ -1,24 +1,25 @@
 """
 Physio Agent - Telegram Bot
 Tracks exercises, collects injury notes, and builds a recovery picture.
+Uses PostgreSQL for persistent storage (Railway-compatible).
 """
 
-import asyncio
 import json
 import os
 import re
-import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, date
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool as pg_pool
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -29,117 +30,151 @@ from telegram.ext import (
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/London"))
 
-DB_PATH = Path(__file__).parent / "data.db"
-
-# Times for reminders (24h, local time)
 MORNING_HOUR = int(os.environ.get("MORNING_HOUR", "7"))
 EVENING_HOUR = int(os.environ.get("EVENING_HOUR", "18"))
 BEDTIME_HOUR = int(os.environ.get("BEDTIME_HOUR", "22"))
-CHECKIN_HOUR = int(os.environ.get("CHECKIN_HOUR", "13"))  # midday pain check-in
+CHECKIN_HOUR = int(os.environ.get("CHECKIN_HOUR", "13"))
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+_pool = None
 
-        CREATE TABLE IF NOT EXISTS exercises (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
-            name        TEXT,
-            sets        INTEGER,
-            reps        TEXT,
-            frequency   TEXT,
-            notes       TEXT,
-            active      INTEGER DEFAULT 1,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+def get_pool():
+    global _pool
+    if _pool is None:
+        _pool = pg_pool.SimpleConnectionPool(1, 5, DATABASE_URL)
+    return _pool
 
-        CREATE TABLE IF NOT EXISTS exercise_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
-            logged_date TEXT,
-            logged_at   TEXT DEFAULT (datetime('now')),
-            note        TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS injury_logs (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id         INTEGER,
-            logged_at       TEXT DEFAULT (datetime('now')),
-            raw_message     TEXT,
-            body_areas      TEXT,
-            severity        TEXT,
-            timing          TEXT,
-            triggers        TEXT,
-            what_helped     TEXT,
-            extra_notes     TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS reminders (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
-            type        TEXT,
-            sent_at     TEXT DEFAULT (datetime('now')),
-            dismissed   INTEGER DEFAULT 0
-        );
-    """)
-    con.commit()
-    con.close()
-
-
+@contextmanager
 def db():
-    return sqlite3.connect(DB_PATH)
+    pool = get_pool()
+    con = pool.getconn()
+    con.autocommit = False
+    try:
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        pool.putconn(con)
+
+
+def init_db():
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id     BIGINT PRIMARY KEY,
+                username    TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS exercises (
+                id          SERIAL PRIMARY KEY,
+                chat_id     BIGINT,
+                name        TEXT,
+                sets        INTEGER,
+                reps        TEXT,
+                frequency   TEXT,
+                notes       TEXT,
+                active      BOOLEAN DEFAULT TRUE,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS exercise_logs (
+                id          SERIAL PRIMARY KEY,
+                chat_id     BIGINT,
+                logged_date DATE,
+                logged_at   TIMESTAMPTZ DEFAULT NOW(),
+                note        TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS injury_logs (
+                id          SERIAL PRIMARY KEY,
+                chat_id     BIGINT,
+                logged_at   TIMESTAMPTZ DEFAULT NOW(),
+                raw_message TEXT,
+                body_areas  TEXT,
+                severity    TEXT,
+                timing      TEXT,
+                triggers    TEXT,
+                what_helped TEXT,
+                extra_notes TEXT
+            )
+        """)
+    print("Database initialised.")
 
 
 def get_exercises(chat_id: int) -> list[dict]:
     with db() as con:
-        rows = con.execute(
-            "SELECT id, name, sets, reps, frequency, notes FROM exercises WHERE chat_id=? AND active=1",
+        cur = con.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id, name, sets, reps, frequency, notes FROM exercises WHERE chat_id=%s AND active=TRUE",
             (chat_id,)
-        ).fetchall()
-    return [{"id": r[0], "name": r[1], "sets": r[2], "reps": r[3], "frequency": r[4], "notes": r[5]} for r in rows]
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 def has_done_exercises_today(chat_id: int) -> bool:
-    today = date.today().isoformat()
+    today = date.today()
     with db() as con:
-        row = con.execute(
-            "SELECT id FROM exercise_logs WHERE chat_id=? AND logged_date=?",
+        cur = con.cursor()
+        cur.execute(
+            "SELECT id FROM exercise_logs WHERE chat_id=%s AND logged_date=%s",
             (chat_id, today)
-        ).fetchone()
-    return row is not None
+        )
+        return cur.fetchone() is not None
 
 
 def log_exercises_done(chat_id: int, note: str = ""):
-    today = date.today().isoformat()
+    today = date.today()
     with db() as con:
-        con.execute(
-            "INSERT INTO exercise_logs (chat_id, logged_date, note) VALUES (?,?,?)",
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO exercise_logs (chat_id, logged_date, note) VALUES (%s, %s, %s)",
             (chat_id, today, note)
         )
 
 
 def get_all_chat_ids() -> list[int]:
     with db() as con:
-        rows = con.execute("SELECT chat_id FROM users").fetchall()
-    return [r[0] for r in rows]
+        cur = con.cursor()
+        cur.execute("SELECT chat_id FROM users")
+        return [r[0] for r in cur.fetchall()]
 
 
 def register_user(chat_id: int, username: str):
     with db() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO users (chat_id, username) VALUES (?,?)",
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO users (chat_id, username) VALUES (%s, %s) ON CONFLICT (chat_id) DO NOTHING",
             (chat_id, username)
         )
+
+
+def save_injury_log(chat_id: int, raw: str, parsed: dict):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO injury_logs
+                (chat_id, raw_message, body_areas, severity, timing, triggers, what_helped, extra_notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            chat_id, raw,
+            json.dumps(parsed.get("body_areas") or []),
+            parsed.get("severity") or "",
+            parsed.get("timing") or "",
+            parsed.get("triggers") or "",
+            parsed.get("what_helped") or "",
+            parsed.get("extra_notes") or "",
+        ))
 
 
 # ── AI helpers ────────────────────────────────────────────────────────────────
@@ -176,39 +211,24 @@ Return ONLY the JSON, no explanation."""
         return {}
 
 
-def save_injury_log(chat_id: int, raw: str, parsed: dict):
-    with db() as con:
-        con.execute("""
-            INSERT INTO injury_logs
-                (chat_id, raw_message, body_areas, severity, timing, triggers, what_helped, extra_notes)
-            VALUES (?,?,?,?,?,?,?,?)
-        """, (
-            chat_id, raw,
-            json.dumps(parsed.get("body_areas") or []),
-            parsed.get("severity") or "",
-            parsed.get("timing") or "",
-            parsed.get("triggers") or "",
-            parsed.get("what_helped") or "",
-            parsed.get("extra_notes") or "",
-        ))
-
-
 def generate_physio_report(chat_id: int) -> str:
-    """Ask Claude to write a physio report from all collected data."""
     exercises = get_exercises(chat_id)
 
     with db() as con:
-        logs = con.execute(
-            "SELECT logged_date, note FROM exercise_logs WHERE chat_id=? ORDER BY logged_date DESC LIMIT 30",
+        cur = con.cursor()
+        cur.execute(
+            "SELECT logged_date, note FROM exercise_logs WHERE chat_id=%s ORDER BY logged_date DESC LIMIT 30",
             (chat_id,)
-        ).fetchall()
-        injuries = con.execute(
-            "SELECT logged_at, raw_message, body_areas, severity, timing, triggers, what_helped FROM injury_logs WHERE chat_id=? ORDER BY logged_at DESC LIMIT 50",
+        )
+        logs = cur.fetchall()
+        cur.execute(
+            "SELECT logged_at, raw_message, body_areas, severity, timing, triggers, what_helped FROM injury_logs WHERE chat_id=%s ORDER BY logged_at DESC LIMIT 50",
             (chat_id,)
-        ).fetchall()
+        )
+        injuries = cur.fetchall()
 
     ex_text = "\n".join(f"- {e['name']}: {e['sets']} sets x {e['reps']} ({e['frequency']})" for e in exercises)
-    log_text = "\n".join(f"[{l[0]}] Done. {l[1]}" for l in logs) or "No exercise logs yet."
+    log_text = "\n".join(f"[{l[0]}] Done. {l[1] or ''}" for l in logs) or "No exercise logs yet."
     inj_text = "\n".join(
         f"[{i[0]}] {i[1]} | Areas: {i[2]} | Severity: {i[3]} | When: {i[4]} | Triggers: {i[5]} | Helped: {i[6]}"
         for i in injuries
@@ -249,7 +269,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username or update.effective_user.first_name
     register_user(chat_id, username)
-
     await update.message.reply_text(
         "👋 *Physio Agent active!*\n\n"
         "I'll help you stay on top of your exercises and track how your body's feeling.\n\n"
@@ -269,7 +288,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_routine(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     exercises = get_exercises(chat_id)
-
     if not exercises:
         await update.message.reply_text(
             "You don't have any exercises set up yet.\n\n"
@@ -321,25 +339,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     exercises = get_exercises(chat_id)
 
     with db() as con:
-        recent_injuries = con.execute(
-            "SELECT logged_at, raw_message FROM injury_logs WHERE chat_id=? ORDER BY logged_at DESC LIMIT 3",
+        cur = con.cursor()
+        cur.execute(
+            "SELECT logged_at, raw_message FROM injury_logs WHERE chat_id=%s ORDER BY logged_at DESC LIMIT 3",
             (chat_id,)
-        ).fetchall()
+        )
+        recent_injuries = cur.fetchall()
 
     lines = [f"*Today — {date.today().strftime('%A %d %B')}*\n"]
     lines.append(f"{'✅' if done else '❌'} Exercises {'done' if done else 'not yet logged'}")
-
     if exercises:
         lines.append(f"\n*Routine ({len(exercises)} exercises):*")
         for e in exercises:
             lines.append(f"• {e['name']} — {e['sets']}×{e['reps']}")
-
     if recent_injuries:
         lines.append("\n*Recent notes:*")
         for ts, msg in recent_injuries:
-            t = datetime.fromisoformat(ts).strftime("%H:%M")
+            t = ts.strftime("%H:%M") if hasattr(ts, 'strftime') else str(ts)[:5]
             lines.append(f"• [{t}] {msg[:80]}{'…' if len(msg) > 80 else ''}")
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -348,21 +365,17 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Generating your physio report… this may take a moment.")
     try:
         report = generate_physio_report(chat_id)
-        # Split if too long for Telegram
         if len(report) > 4000:
-            chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
-            for chunk in chunks:
+            for chunk in [report[i:i+4000] for i in range(0, len(report), 4000)]:
                 await update.message.reply_text(chunk)
         else:
             await update.message.reply_text(report)
-        await update.message.reply_text(
-            "📋 That's your report. You can copy this and share it with your physio."
-        )
+        await update.message.reply_text("📋 That's your report. You can copy this and share it with your physio.")
     except Exception as e:
         await update.message.reply_text(f"Sorry, couldn't generate the report: {e}")
 
 
-# ── Message handler (natural language) ───────────────────────────────────────
+# ── Message handler ───────────────────────────────────────────────────────────
 
 ADD_PATTERN = re.compile(r"^ADD:\s*(.+),\s*(\d+),\s*(.+),\s*(.+)$", re.IGNORECASE)
 REMOVE_PATTERN = re.compile(r"^REMOVE:\s*(.+)$", re.IGNORECASE)
@@ -376,64 +389,53 @@ INJURY_KEYWORDS = re.compile(
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-
-    # Register user if not known
     register_user(chat_id, update.effective_user.username or "")
 
-    # ADD exercise
     m = ADD_PATTERN.match(text)
     if m:
         name, sets, reps, freq = m.group(1).strip(), int(m.group(2)), m.group(3).strip(), m.group(4).strip()
         with db() as con:
-            con.execute(
-                "INSERT INTO exercises (chat_id, name, sets, reps, frequency) VALUES (?,?,?,?,?)",
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO exercises (chat_id, name, sets, reps, frequency) VALUES (%s, %s, %s, %s, %s)",
                 (chat_id, name, sets, reps, freq)
             )
         await update.message.reply_text(f"✅ Added: *{name}* — {sets} sets × {reps} | {freq}", parse_mode="Markdown")
         return
 
-    # REMOVE exercise
     m = REMOVE_PATTERN.match(text)
     if m:
         name = m.group(1).strip()
         with db() as con:
-            con.execute(
-                "UPDATE exercises SET active=0 WHERE chat_id=? AND name LIKE ?",
+            cur = con.cursor()
+            cur.execute(
+                "UPDATE exercises SET active=FALSE WHERE chat_id=%s AND name ILIKE %s",
                 (chat_id, f"%{name}%")
             )
         await update.message.reply_text(f"🗑️ Removed exercise matching: *{name}*", parse_mode="Markdown")
         return
 
-    # "I've done my exercises" type message
     if DONE_PATTERN.search(text) and not has_done_exercises_today(chat_id):
         log_exercises_done(chat_id, note=text)
-        await update.message.reply_text(
-            "✅ Logged — exercises done for today. Nice work!\n\n"
-            "How did it feel?",
-        )
+        await update.message.reply_text("✅ Logged — exercises done for today. Nice work!\n\nHow did it feel?")
         return
 
-    # Injury/pain note — extract and save
     if INJURY_KEYWORDS.search(text) or len(text) > 30:
         await update.message.reply_text("📝 Got it, logging that…")
         parsed = extract_injury_data(text)
         save_injury_log(chat_id, text, parsed)
-
         areas = ", ".join(parsed.get("body_areas") or []) or "noted"
         helped = parsed.get("what_helped")
         triggers = parsed.get("triggers")
-
         reply = f"✅ Logged your note. I picked up: *{areas}*."
         if triggers:
             reply += f"\nPossible trigger: _{triggers}_"
         if helped:
             reply += f"\nWhat helped: _{helped}_"
         reply += "\n\nKeep noting how you feel — it all builds the picture."
-
         await update.message.reply_text(reply, parse_mode="Markdown")
         return
 
-    # Fallback
     await update.message.reply_text(
         "Got your message. If you're describing pain or discomfort, try to include a bit more detail "
         "so I can log it properly — e.g. _'my left calf has been tight since this morning'_.\n\n"
@@ -445,12 +447,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Scheduled reminders ───────────────────────────────────────────────────────
 
 async def send_exercise_reminder(app: Application, reminder_type: str):
-    chat_ids = get_all_chat_ids()
     messages = {
         "morning": (
             "☀️ *Good morning!*\n\n"
-            "Don't forget your physio exercises today. Do them when you get a chance — "
-            "tap /done once you're finished, or just tell me.\n\n"
+            "Don't forget your physio exercises today. Tap /done once you're finished, or just tell me.\n\n"
             "How are you feeling this morning?"
         ),
         "evening": (
@@ -469,10 +469,8 @@ async def send_exercise_reminder(app: Application, reminder_type: str):
             "Just reply in your own words — I'll log it."
         ),
     }
-
     msg = messages.get(reminder_type, "")
-    for chat_id in chat_ids:
-        # Skip exercise reminders if already done today (except check-in)
+    for chat_id in get_all_chat_ids():
         if reminder_type in ("morning", "evening", "bedtime") and has_done_exercises_today(chat_id):
             if reminder_type == "bedtime":
                 await app.bot.send_message(
@@ -496,33 +494,22 @@ def main():
     if not ANTHROPIC_API_KEY:
         print("ERROR: Set ANTHROPIC_API_KEY environment variable")
         return
+    if not DATABASE_URL:
+        print("ERROR: Set DATABASE_URL environment variable")
+        return
 
     init_db()
-    print("Database initialised.")
 
     async def post_init(application: Application):
         scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-        scheduler.add_job(
-            send_exercise_reminder, CronTrigger(hour=MORNING_HOUR, minute=0),
-            args=[application, "morning"]
-        )
-        scheduler.add_job(
-            send_exercise_reminder, CronTrigger(hour=CHECKIN_HOUR, minute=0),
-            args=[application, "checkin"]
-        )
-        scheduler.add_job(
-            send_exercise_reminder, CronTrigger(hour=EVENING_HOUR, minute=0),
-            args=[application, "evening"]
-        )
-        scheduler.add_job(
-            send_exercise_reminder, CronTrigger(hour=BEDTIME_HOUR, minute=0),
-            args=[application, "bedtime"]
-        )
+        scheduler.add_job(send_exercise_reminder, CronTrigger(hour=MORNING_HOUR, minute=0), args=[application, "morning"])
+        scheduler.add_job(send_exercise_reminder, CronTrigger(hour=CHECKIN_HOUR, minute=0), args=[application, "checkin"])
+        scheduler.add_job(send_exercise_reminder, CronTrigger(hour=EVENING_HOUR, minute=0), args=[application, "evening"])
+        scheduler.add_job(send_exercise_reminder, CronTrigger(hour=BEDTIME_HOUR, minute=0), args=[application, "bedtime"])
         scheduler.start()
         print(f"Scheduler started. Reminders at {MORNING_HOUR}:00, {CHECKIN_HOUR}:00, {EVENING_HOUR}:00, {BEDTIME_HOUR}:00")
 
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("routine", cmd_routine))
     app.add_handler(CommandHandler("done", cmd_done))
